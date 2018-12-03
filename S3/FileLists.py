@@ -24,6 +24,7 @@ import glob
 import re
 import errno
 import io
+import collections
 
 __all__ = ["fetch_local_list", "fetch_remote_list", "compare_filelists"]
 
@@ -403,6 +404,17 @@ def fetch_remote_list(args, require_attribs = False, recursive = None, uri_param
             remote_uri = S3Uri(u"s3://%s/%s" % (remote_uri.bucket(), rem_base))
         rem_base_len = len(rem_base)
         rem_list = FileDict(ignore_case = False)
+        for object in response['common_prefixes']:
+            prefix = object['Prefix']
+            key = prefix[rem_base_len:]
+            object_uri_str = remote_uri.uri() + key
+            rem_list[key] = {
+                'type': 'prefix',
+                'object_key': prefix,
+                'object_uri_str': object_uri_str,
+                'base_uri': remote_uri,
+            }
+
         break_now = False
         for object in response['list']:
             if object['Key'] == rem_base_original and object['Key'][-1] != "/":
@@ -419,6 +431,7 @@ def fetch_remote_list(args, require_attribs = False, recursive = None, uri_param
                 warning(u"Empty object name on S3 found, ignoring.")
                 continue
             rem_list[key] = {
+                'type': 'object',
                 'size' : int(object['Size']),
                 'timestamp' : dateS3toUnix(object['LastModified']), ## Sadly it's upload time, not our lastmod time :-(
                 'md5' : object['ETag'].strip('"\''),
@@ -437,8 +450,39 @@ def fetch_remote_list(args, require_attribs = False, recursive = None, uri_param
                 break
         return rem_list, total_size
 
+    def _get_recursive_uri(remote_list, remote_uri):
+        objectlist, tmp_total_size = _get_filelist_remote(remote_uri, recursive=True)
+        for key in objectlist:
+            object = objectlist[key]
+            type_value = object.pop('type', 'object')
+            if type_value != 'object':
+                raise ValueError('Expected an object type, got %s - %r' % (type_value, object))
+
+            remote_list[key] = object
+            remote_list.record_md5(key, objectlist.get_md5(key))
+
+        return tmp_total_size
+
+    def _add_wildcard_matches(remote_uris, remote_list, remote_uri, pattern, suffix):
+        objectlist, total_size = _get_filelist_remote(remote_uri, recursive=False)
+        for key in objectlist:
+            object = objectlist[key]
+            object_uri_str = object['object_uri_str']
+            object_type = object['type']
+
+            if pattern and not glob.fnmatch.fnmatch(object_uri_str, pattern):
+                continue
+
+            if object_type == 'prefix' and suffix:
+                remote_uris.append(S3Uri(object_uri_str + suffix))
+            else:
+                remote_list[key] = object
+
+        return total_size
+
+    wildcard = re.compile(r'(\*\*|\*(?!\*)|\?)')
     cfg = Config()
-    remote_uris = []
+    remote_uris = collections.deque()
     remote_list = FileDict(ignore_case = False)
 
     if type(args) not in (list, tuple, set):
@@ -455,48 +499,37 @@ def fetch_remote_list(args, require_attribs = False, recursive = None, uri_param
 
     total_size = 0
 
-    if recursive:
-        for uri in remote_uris:
-            objectlist, tmp_total_size = _get_filelist_remote(uri, recursive = True)
-            total_size += tmp_total_size
-            for key in objectlist:
-                remote_list[key] = objectlist[key]
-                remote_list.record_md5(key, objectlist.get_md5(key))
-    else:
-        for uri in remote_uris:
-            uri_str = uri.uri()
-            ## Wildcards used in remote URI?
-            ## If yes we'll need a bucket listing...
-            wildcard_split_result = re.split("\*|\?", uri_str, maxsplit=1)
-            if len(wildcard_split_result) == 2: # wildcards found
-                prefix, rest = wildcard_split_result
-                ## Only request recursive listing if the 'rest' of the URI,
-                ## i.e. the part after first wildcard, contains '/'
-                need_recursion = '/' in rest
-                objectlist, tmp_total_size = _get_filelist_remote(S3Uri(prefix), recursive = need_recursion)
-                total_size += tmp_total_size
-                for key in objectlist:
-                    ## Check whether the 'key' matches the requested wildcards
-                    if glob.fnmatch.fnmatch(objectlist[key]['object_uri_str'], uri_str):
-                        remote_list[key] = objectlist[key]
-            else:
-                ## No wildcards - simply append the given URI to the list
-                key = unicodise(os.path.basename(deunicodise(uri.object())))
-                if not key:
-                    raise ParameterError(u"Expecting S3 URI with a filename or --recursive: %s" % uri.uri())
-                remote_item = {
-                    'base_uri': uri,
-                    'object_uri_str': uri.uri(),
-                    'object_key': uri.object()
-                }
-                if require_attribs:
-                    _get_remote_attribs(uri, remote_item)
+    while remote_uris:
+        uri = remote_uris.popleft()
+        uri_str = uri.uri()
+        wildcard_split_result = wildcard.split(uri_str, maxsplit=1)
+        if len(wildcard_split_result) == 3:  # wildcards found
+            prefix, token, tail = wildcard_split_result
+        else:
+            prefix, = wildcard_split_result
+            token = tail = ''
 
-                remote_list[key] = remote_item
-                md5 = remote_item.get('md5')
-                if md5:
-                    remote_list.record_md5(key, md5)
-                total_size += remote_item.get('size', 0)
+        prefix_uri = S3Uri(prefix)
+        is_dir = prefix == '' or prefix[-1] == '/'
+        need_recursion = is_dir and (token == '**' or recursive)
+
+        if need_recursion and tail == '':
+            total_size += _get_recursive_uri(remote_list, prefix_uri)
+            continue
+
+        tail, sep, rest = tail.partition('/')
+
+        if need_recursion and tail == '':
+            suffix = ''.join([token, sep, rest])
+            pattern = '*'
+        else:
+            suffix = rest
+            pattern = ''.join([prefix, token, tail, sep])
+
+        if token == '':
+            pattern = '*'
+
+        total_size += _add_wildcard_matches(remote_uris, remote_list, prefix_uri, pattern, rest)
 
     remote_list, exclude_list = filter_exclude_include(remote_list)
     return remote_list, exclude_list, total_size
